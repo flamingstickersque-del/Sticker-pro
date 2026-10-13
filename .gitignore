@@ -11,6 +11,8 @@ dist-ssr/
 # Tauri & Rust artifacts
 src-tauri/target/
 target/
+.cargo/
+src-tauri/.cargo/
 
 # Environment files
 .env

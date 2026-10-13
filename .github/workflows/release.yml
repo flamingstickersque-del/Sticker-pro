@@ -42,12 +42,14 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: lts/*
           cache: 'npm'
 
       - name: Setup Rust toolchain
@@ -56,16 +58,16 @@ jobs:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Install Node dependencies
-        run: npm ci
+        run: npm install
 
       - name: Build and Package with Tauri Action
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__
-          releaseName: 'StickerCut PRO v__VERSION__'
+          tagName: ${{ github.ref_name }}
+          releaseName: 'StickerCut PRO ${{ github.ref_name }}'
           releaseBody: 'Official Multi-Platform Desktop Release (Windows, macOS, Linux)'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
