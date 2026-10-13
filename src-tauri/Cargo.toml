@@ -1,0 +1,20 @@
+[package]
+name = "sticker-cut-pro"
+version = "1.0.0"
+description = "StickerCut PRO — Print & Cut Sheet Production Studio"
+authors = ["JONC"]
+edition = "2021"
+
+[lib]
+name = "sticker_cut_pro_lib"
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

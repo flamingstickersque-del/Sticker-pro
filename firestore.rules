@@ -1,0 +1,50 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for authentication and input validation
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidProjectPayload(userId) {
+      let data = request.resource.data;
+      return data.userId == userId
+        && data.projectName is string
+        && data.projectName.size() > 0
+        && data.projectName.size() <= 120
+        && data.unit in ['mm', 'in']
+        && (!('artworkList' in data) || data.artworkList is list && data.artworkList.size() <= 250);
+    }
+
+    // User production settings and profile configuration
+    match /users/{userId}/settings/{settingId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && request.resource.data.userId == userId;
+      allow update: if isOwner(userId)
+        && request.resource.data.userId == resource.data.userId;
+      allow delete: if isOwner(userId);
+    }
+
+    // User sticker projects and saved production sheet data
+    match /users/{userId}/projects/{projectId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && isValidProjectPayload(userId);
+      allow update: if isOwner(userId)
+        && request.resource.data.userId == resource.data.userId
+        && isValidProjectPayload(userId);
+      allow delete: if isOwner(userId);
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

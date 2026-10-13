@@ -1,0 +1,30 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidArtworkUpload() {
+      return request.resource.size < 30 * 1024 * 1024 // Max 30MB
+        && request.resource.contentType.matches('image/.*|application/pdf|application/octet-stream');
+    }
+
+    // Isolated user-scoped artwork storage
+    match /users/{userId}/{allPaths=**} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidArtworkUpload();
+      allow delete: if isOwner(userId);
+    }
+
+    // Default deny
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
