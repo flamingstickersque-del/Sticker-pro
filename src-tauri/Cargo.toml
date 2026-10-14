@@ -1,6 +1,6 @@
 [package]
 name = "sticker-cut-pro"
-version = "1.0.0"
+version = "1.0.2"
 description = "StickerCut PRO — Print & Cut Sheet Production Studio"
 authors = ["JONC"]
 edition = "2021"
