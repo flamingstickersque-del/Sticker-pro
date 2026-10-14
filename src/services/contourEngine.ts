@@ -540,273 +540,342 @@ export function fitPaperJsBezierPath(
  * ensuring complete outer silhouette extraction with all interior cavities (holes in handles,
  * letter counters) solidly preserved as foreground.
  */
-export async function extractArtworkPerimeter(
-  dataUrlOrSvg: string,
-  sampleResolution = 1024,
-  alphaThreshold = 16
-): Promise<Point2D[]> {
-  return new Promise((resolve) => {
-    if (typeof window === 'undefined' || !dataUrlOrSvg) {
-      resolve([]);
-      return;
+export interface PerimeterTraceResult {
+  points: Point2D[];
+  /** Human-readable diagnostic info for debugging */
+  diagnostics?: {
+    thresholdUsed: number;
+    transparentPixelRatio: number;
+    method: 'alpha' | 'color_diff' | 'none';
+    retryCount: number;
+  };
+}
+
+/**
+ * Core perimeter extraction logic shared across retry attempts.
+ * @returns Traced boundary points in normalized [-0.5..0.5] coordinates, or null on failure.
+ */
+function tracePerimeterFromImageData(
+  data: Uint8ClampedArray,
+  paddedW: number,
+  paddedH: number,
+  padding: number,
+  W: number,
+  H: number,
+  alphaThreshold: number
+): Point2D[] | null {
+  const totalPixels = paddedW * paddedH;
+
+  // 1. Detect transparency & create binary grid
+  let transparentCount = 0;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] < alphaThreshold) transparentCount++;
+  }
+
+  const hasAlpha = transparentCount > 10;
+  const rawGrid = new Uint8Array(totalPixels);
+
+  if (hasAlpha) {
+    for (let i = 0; i < totalPixels; i++) {
+      rawGrid[i] = data[i * 4 + 3] >= alphaThreshold ? 1 : 0;
+    }
+  } else {
+    // Solid substrate without alpha: sample outer border to establish background
+    const c1 = [data[0], data[1], data[2]];
+    const c2 = [data[(paddedW - 1) * 4], data[(paddedW - 1) * 4 + 1], data[(paddedW - 1) * 4 + 2]];
+    const c3 = [data[(paddedH - 1) * paddedW * 4], data[(paddedH - 1) * paddedW * 4 + 1], data[(paddedH - 1) * paddedW * 4 + 2]];
+    const c4 = [data[(paddedH * paddedW - 1) * 4], data[(paddedH * paddedW - 1) * 4 + 1], data[(paddedH * paddedW - 1) * 4 + 2]];
+    const bgR = (c1[0] + c2[0] + c3[0] + c4[0]) / 4;
+    const bgG = (c1[1] + c2[1] + c3[1] + c4[1]) / 4;
+    const bgB = (c1[2] + c2[2] + c3[2] + c4[2]) / 4;
+
+    for (let i = 0; i < totalPixels; i++) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      const diff = Math.hypot(r - bgR, g - bgG, b - bgB);
+      rawGrid[i] = diff > 30 ? 1 : 0;
+    }
+  }
+
+  // 2. EXTERIOR FLOOD-FILL (BFS)
+  // Starts from all outer borders of the padded canvas
+  const visitedExterior = new Uint8Array(totalPixels);
+  const queue: number[] = [];
+
+  for (let x = 0; x < paddedW; x++) {
+    const topIdx = x;
+    const btmIdx = (paddedH - 1) * paddedW + x;
+    if (rawGrid[topIdx] === 0 && visitedExterior[topIdx] === 0) {
+      visitedExterior[topIdx] = 1;
+      queue.push(topIdx);
+    }
+    if (rawGrid[btmIdx] === 0 && visitedExterior[btmIdx] === 0) {
+      visitedExterior[btmIdx] = 1;
+      queue.push(btmIdx);
+    }
+  }
+  for (let y = 0; y < paddedH; y++) {
+    const leftIdx = y * paddedW;
+    const rightIdx = y * paddedW + (paddedW - 1);
+    if (rawGrid[leftIdx] === 0 && visitedExterior[leftIdx] === 0) {
+      visitedExterior[leftIdx] = 1;
+      queue.push(leftIdx);
+    }
+    if (rawGrid[rightIdx] === 0 && visitedExterior[rightIdx] === 0) {
+      visitedExterior[rightIdx] = 1;
+      queue.push(rightIdx);
+    }
+  }
+
+  let qHead = 0;
+  while (qHead < queue.length) {
+    const idx = queue[qHead++];
+    const qx = idx % paddedW;
+    const qy = Math.floor(idx / paddedW);
+
+    const neighbors = [
+      [qx - 1, qy],
+      [qx + 1, qy],
+      [qx, qy - 1],
+      [qx, qy + 1],
+    ];
+
+    for (const [nx, ny] of neighbors) {
+      if (nx >= 0 && nx < paddedW && ny >= 0 && ny < paddedH) {
+        const nIdx = ny * paddedW + nx;
+        if (rawGrid[nIdx] === 0 && visitedExterior[nIdx] === 0) {
+          visitedExterior[nIdx] = 1;
+          queue.push(nIdx);
+        }
+      }
+    }
+  }
+
+  // 3. Create strictly solid outer silhouette
+  const solidGrid = new Uint8Array(totalPixels);
+  let firstX = -1;
+  let firstY = -1;
+
+  for (let y = 0; y < paddedH; y++) {
+    for (let x = 0; x < paddedW; x++) {
+      const idx = y * paddedW + x;
+      if (visitedExterior[idx] === 0) {
+        solidGrid[idx] = 1;
+        if (firstX === -1) {
+          firstX = x;
+          firstY = y;
+        }
+      }
+    }
+  }
+
+  if (firstX === -1 || firstY === -1) {
+    return null;
+  }
+
+  // 4. Moore-Neighbor boundary tracing with Jacob's stopping condition
+  const DIRS: [number, number][] = [
+    [0, -1],  // 0: N
+    [1, -1],  // 1: NE
+    [1, 0],   // 2: E
+    [1, 1],   // 3: SE
+    [0, 1],   // 4: S
+    [-1, 1],  // 5: SW
+    [-1, 0],  // 6: W
+    [-1, -1], // 7: NW
+  ];
+
+  const boundary: Point2D[] = [];
+  let currX = firstX;
+  let currY = firstY;
+  let startDir = 6; // searching clockwise starting from West
+  let secondPt: Point2D | null = null;
+  let maxSteps = 30000;
+
+  boundary.push({ x: currX + 0.5, y: currY + 0.5 });
+
+  while (maxSteps-- > 0) {
+    let found = false;
+    for (let i = 0; i < 8; i++) {
+      const d = (startDir + i) % 8;
+      const nx = currX + DIRS[d][0];
+      const ny = currY + DIRS[d][1];
+
+      if (nx >= 0 && nx < paddedW && ny >= 0 && ny < paddedH && solidGrid[ny * paddedW + nx] === 1) {
+        currX = nx;
+        currY = ny;
+        startDir = (d + 5) % 8;
+        const pt = { x: currX + 0.5, y: currY + 0.5 };
+        boundary.push(pt);
+        found = true;
+
+        if (boundary.length === 2) {
+          secondPt = pt;
+        }
+        break;
+      }
     }
 
-    let srcUrl = dataUrlOrSvg;
-    if (dataUrlOrSvg.trim().startsWith('<svg') || dataUrlOrSvg.trim().startsWith('<?xml')) {
-      const formatted = formatSvgWithExplicitDimensions(dataUrlOrSvg);
-      srcUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(formatted)}`;
+    if (!found) break;
+
+    // Jacob's stopping condition
+    if (
+      boundary.length > 3 &&
+      currX === firstX &&
+      currY === firstY &&
+      secondPt &&
+      boundary[1].x === secondPt.x &&
+      boundary[1].y === secondPt.y
+    ) {
+      break;
     }
+  }
 
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
+  if (boundary.length < 4) {
+    return null;
+  }
 
-    img.onload = () => {
-      try {
-        const naturalW = img.naturalWidth || img.width || 300;
-        const naturalH = img.naturalHeight || img.height || 300;
-        const aspect = naturalW / naturalH;
+  // Remove duplicate closure point if present
+  const last = boundary[boundary.length - 1];
+  const first = boundary[0];
+  if (last.x === first.x && last.y === first.y) {
+    boundary.pop();
+  }
 
-        let W = sampleResolution;
-        let H = Math.round(sampleResolution / aspect);
-        if (H > sampleResolution) {
-          H = sampleResolution;
-          W = Math.round(sampleResolution * aspect);
-        }
-        W = Math.max(120, Math.min(1200, W));
-        H = Math.max(120, Math.min(1200, H));
+  // 5. Convert back from padded coordinates to normalized [-0.5..0.5]
+  const normalized: Point2D[] = boundary.map((p) => ({
+    x: Math.max(-0.5, Math.min(0.5, (p.x - padding) / W - 0.5)),
+    y: Math.max(-0.5, Math.min(0.5, (p.y - padding) / H - 0.5)),
+  }));
 
-        // Padded canvas ensures exterior flood-fill is NEVER blocked even if artwork touches edge
-        const padding = 4;
-        const paddedW = W + padding * 2;
-        const paddedH = H + padding * 2;
+  // 6. Ensure clockwise winding (Y down)
+  let pts = normalized;
+  if (polygonSignedArea(pts) < 0) {
+    pts = [...pts].reverse();
+  }
 
-        const canvas = document.createElement('canvas');
-        canvas.width = paddedW;
-        canvas.height = paddedH;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (!ctx) {
-          resolve([]);
-          return;
-        }
+  // 7. Simplify collinear points and remove clustered micro-nodes
+  const rdpEps = Math.max(0.0005, 0.001);
+  let simplified = ramerDouglasPeucker(pts, rdpEps);
+  if (simplified.length < 4) {
+    simplified = pts;
+  }
+  simplified = removeClusteredNodes(simplified, 0.001);
+  simplified = removePolygonLoops(simplified);
 
-        ctx.clearRect(0, 0, paddedW, paddedH);
-        ctx.drawImage(img, padding, padding, W, H);
-        const imgData = ctx.getImageData(0, 0, paddedW, paddedH);
-        const data = imgData.data;
+  return simplified;
+}
 
-        // 1. Detect transparency & create binary grid
-        let transparentCount = 0;
-        const totalPixels = paddedW * paddedH;
-        for (let i = 3; i < data.length; i += 4) {
-          if (data[i] < alphaThreshold) transparentCount++;
-        }
+/**
+ * Analyzes artwork raster/vector image and extracts STRICTLY its outermost perimeter
+ * silhouette as a normalized polygon with coordinates in range [-0.5..0.5, -0.5..0.5].
+ *
+ * Uses a padded canvas with exterior BFS flood-fill and Moore-Neighbor boundary tracing,
+ * ensuring complete outer silhouette extraction with all interior cavities (holes in handles,
+ * letter counters) solidly preserved as foreground.
+ *
+ * Uses an adaptive alpha-threshold retry cascade to handle soft-edge / anti-aliased images:
+ *   1. Try alpha ≥ 16 (crisp edges) → if empty result
+ *   2. Retry with alpha ≥ 8 (softer edges) → if empty
+ *   3. Retry with alpha ≥ 1 (any non-transparent pixel)
+ */
+export function extractArtworkPerimeter(
+  srcUrl: string,
+  sampleSize: number = 1024,
+  padding: number = 16
+): Promise<PerimeterTraceResult> {
+  return new Promise<PerimeterTraceResult>((resolve) => {
+    try {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
 
-        const hasAlpha = transparentCount > 10;
-        const rawGrid = new Uint8Array(totalPixels);
+      img.onload = () => {
+        try {
+          const W = sampleSize;
+          const H = Math.round(sampleSize * (img.naturalHeight / Math.max(1, img.naturalWidth)));
+          const paddedW = W + padding * 2;
+          const paddedH = H + padding * 2;
 
-        if (hasAlpha) {
-          for (let i = 0; i < totalPixels; i++) {
-            rawGrid[i] = data[i * 4 + 3] >= alphaThreshold ? 1 : 0;
+          const canvas = document.createElement('canvas');
+          canvas.width = paddedW;
+          canvas.height = paddedH;
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          if (!ctx) {
+            console.warn('ContourEngine: Could not get 2d context for perimeter extraction');
+            resolve({ points: [] });
+            return;
           }
-        } else {
-          // Solid substrate without alpha: sample outer border to establish background
-          const c1 = [data[0], data[1], data[2]];
-          const c2 = [data[(paddedW - 1) * 4], data[(paddedW - 1) * 4 + 1], data[(paddedW - 1) * 4 + 2]];
-          const c3 = [data[(paddedH - 1) * paddedW * 4], data[(paddedH - 1) * paddedW * 4 + 1], data[(paddedH - 1) * paddedW * 4 + 2]];
-          const c4 = [data[(paddedH * paddedW - 1) * 4], data[(paddedH * paddedW - 1) * 4 + 1], data[(paddedH * paddedW - 1) * 4 + 2]];
-          const bgR = (c1[0] + c2[0] + c3[0] + c4[0]) / 4;
-          const bgG = (c1[1] + c2[1] + c3[1] + c4[1]) / 4;
-          const bgB = (c1[2] + c2[2] + c3[2] + c4[2]) / 4;
 
-          for (let i = 0; i < totalPixels; i++) {
-            const r = data[i * 4];
-            const g = data[i * 4 + 1];
-            const b = data[i * 4 + 2];
-            const diff = Math.hypot(r - bgR, g - bgG, b - bgB);
-            rawGrid[i] = diff > 30 ? 1 : 0;
-          }
-        }
+          ctx.drawImage(img, padding, padding, W, H);
+          const imageData = ctx.getImageData(0, 0, paddedW, paddedH);
+          const data = imageData.data;
 
-        // 2. EXTERIOR FLOOD-FILL (BFS)
-        // Starts from all outer borders of the padded canvas
-        const visitedExterior = new Uint8Array(totalPixels);
-        const queue: number[] = [];
+          // Adaptive threshold retry cascade for soft-edge / anti-aliased images
+          const thresholds = [16, 8, 1];
+          let points: Point2D[] | null = null;
+          let thresholdUsed = thresholds[0];
+          let retryCount = 0;
 
-        for (let x = 0; x < paddedW; x++) {
-          const topIdx = x;
-          const btmIdx = (paddedH - 1) * paddedW + x;
-          if (rawGrid[topIdx] === 0 && visitedExterior[topIdx] === 0) {
-            visitedExterior[topIdx] = 1;
-            queue.push(topIdx);
-          }
-          if (rawGrid[btmIdx] === 0 && visitedExterior[btmIdx] === 0) {
-            visitedExterior[btmIdx] = 1;
-            queue.push(btmIdx);
-          }
-        }
-        for (let y = 0; y < paddedH; y++) {
-          const leftIdx = y * paddedW;
-          const rightIdx = y * paddedW + (paddedW - 1);
-          if (rawGrid[leftIdx] === 0 && visitedExterior[leftIdx] === 0) {
-            visitedExterior[leftIdx] = 1;
-            queue.push(leftIdx);
-          }
-          if (rawGrid[rightIdx] === 0 && visitedExterior[rightIdx] === 0) {
-            visitedExterior[rightIdx] = 1;
-            queue.push(rightIdx);
-          }
-        }
-
-        let qHead = 0;
-        while (qHead < queue.length) {
-          const idx = queue[qHead++];
-          const qx = idx % paddedW;
-          const qy = Math.floor(idx / paddedW);
-
-          const neighbors = [
-            [qx - 1, qy],
-            [qx + 1, qy],
-            [qx, qy - 1],
-            [qx, qy + 1],
-          ];
-
-          for (const [nx, ny] of neighbors) {
-            if (nx >= 0 && nx < paddedW && ny >= 0 && ny < paddedH) {
-              const nIdx = ny * paddedW + nx;
-              if (rawGrid[nIdx] === 0 && visitedExterior[nIdx] === 0) {
-                visitedExterior[nIdx] = 1;
-                queue.push(nIdx);
-              }
-            }
-          }
-        }
-
-        // 3. Create strictly solid outer silhouette
-        const solidGrid = new Uint8Array(totalPixels);
-        let firstX = -1;
-        let firstY = -1;
-
-        for (let y = 0; y < paddedH; y++) {
-          for (let x = 0; x < paddedW; x++) {
-            const idx = y * paddedW + x;
-            if (visitedExterior[idx] === 0) {
-              solidGrid[idx] = 1;
-              if (firstX === -1) {
-                firstX = x;
-                firstY = y;
-              }
-            }
-          }
-        }
-
-        if (firstX === -1 || firstY === -1) {
-          resolve([]);
-          return;
-        }
-
-        // 4. Moore-Neighbor boundary tracing with Jacob's stopping condition
-        const DIRS: [number, number][] = [
-          [0, -1],  // 0: N
-          [1, -1],  // 1: NE
-          [1, 0],   // 2: E
-          [1, 1],   // 3: SE
-          [0, 1],   // 4: S
-          [-1, 1],  // 5: SW
-          [-1, 0],  // 6: W
-          [-1, -1], // 7: NW
-        ];
-
-        const boundary: Point2D[] = [];
-        let currX = firstX;
-        let currY = firstY;
-        let startDir = 6; // searching clockwise starting from West
-        let secondPt: Point2D | null = null;
-        let maxSteps = 30000;
-
-        boundary.push({ x: currX + 0.5, y: currY + 0.5 });
-
-        while (maxSteps-- > 0) {
-          let found = false;
-          for (let i = 0; i < 8; i++) {
-            const d = (startDir + i) % 8;
-            const nx = currX + DIRS[d][0];
-            const ny = currY + DIRS[d][1];
-
-            if (nx >= 0 && nx < paddedW && ny >= 0 && ny < paddedH && solidGrid[ny * paddedW + nx] === 1) {
-              currX = nx;
-              currY = ny;
-              startDir = (d + 5) % 8;
-              const pt = { x: currX + 0.5, y: currY + 0.5 };
-              boundary.push(pt);
-              found = true;
-
-              if (boundary.length === 2) {
-                secondPt = pt;
-              }
+          for (const t of thresholds) {
+            const result = tracePerimeterFromImageData(data, paddedW, paddedH, padding, W, H, t);
+            if (result !== null && result.length >= 3) {
+              points = result;
+              thresholdUsed = t;
               break;
             }
+            retryCount++;
           }
 
-          if (!found) break;
-
-          // Jacob's stopping condition
-          if (
-            boundary.length > 3 &&
-            currX === firstX &&
-            currY === firstY &&
-            secondPt &&
-            boundary[1].x === secondPt.x &&
-            boundary[1].y === secondPt.y
-          ) {
-            break;
+          // Compute transparency ratio for diagnostics
+          let transparentPixelRatio = 0;
+          for (let i = 3; i < data.length; i += 4) {
+            if (data[i] < thresholdUsed) transparentPixelRatio++;
           }
+          transparentPixelRatio /= (paddedW * paddedH);
+
+          if (!points || points.length < 3) {
+            console.warn(
+              `ContourEngine: Perimeter extraction failed after ${thresholds.length} threshold attempts. ` +
+              `Image may be fully transparent or too small at sample resolution.`
+            );
+            resolve({
+              points: [],
+              diagnostics: {
+                thresholdUsed,
+                transparentPixelRatio: Math.round(transparentPixelRatio * 100) / 100,
+                method: transparentPixelRatio > 0.05 ? 'alpha' : 'none',
+                retryCount,
+              },
+            });
+            return;
+          }
+
+          resolve({
+            points,
+            diagnostics: {
+              thresholdUsed,
+              transparentPixelRatio: Math.round(transparentPixelRatio * 100) / 100,
+              method: transparentPixelRatio > 0.05 ? 'alpha' : 'color_diff',
+              retryCount,
+            },
+          });
+        } catch (err) {
+          console.warn('ContourEngine: Error in perimeter extraction image processing:', err);
+          resolve({ points: [] });
         }
+      };
 
-        if (boundary.length < 4) {
-          resolve([]);
-          return;
-        }
+      img.onerror = () => {
+        console.warn('ContourEngine: Failed to load image for perimeter extraction');
+        resolve({ points: [] });
+      };
 
-        // Remove duplicate closure point if present
-        const last = boundary[boundary.length - 1];
-        const first = boundary[0];
-        if (last.x === first.x && last.y === first.y) {
-          boundary.pop();
-        }
-
-        // 5. Convert back from padded coordinates to normalized [-0.5..0.5]
-        const normalized: Point2D[] = boundary.map((p) => ({
-          x: Math.max(-0.5, Math.min(0.5, (p.x - padding) / W - 0.5)),
-          y: Math.max(-0.5, Math.min(0.5, (p.y - padding) / H - 0.5)),
-        }));
-
-        // 6. Ensure clockwise winding (Y down)
-        let pts = normalized;
-        if (polygonSignedArea(pts) < 0) {
-          pts = [...pts].reverse();
-        }
-
-        // 7. Simplify collinear points and remove clustered micro-nodes
-        const rdpEps = Math.max(0.0005, 0.001);
-        let simplified = ramerDouglasPeucker(pts, rdpEps);
-        if (simplified.length < 4) {
-          simplified = pts;
-        }
-        simplified = removeClusteredNodes(simplified, 0.001);
-        simplified = removePolygonLoops(simplified);
-
-        resolve(simplified);
-      } catch (err) {
-        console.warn('Perimeter detection fallback:', err);
-        resolve([]);
-      }
-    };
-
-    img.onerror = () => {
-      resolve([]);
-    };
-
-    img.src = srcUrl;
+      img.src = srcUrl;
+    } catch (err) {
+      console.warn('ContourEngine: Unexpected error in extractArtworkPerimeter:', err);
+      resolve({ points: [] });
+    }
   });
 }
 

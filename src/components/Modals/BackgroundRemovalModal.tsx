@@ -63,6 +63,7 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
   const [isExportingDirect, setIsExportingDirect] = useState<boolean>(false);
   const [processedResult, setProcessedResult] = useState<BackgroundRemovalResult | null>(null);
   const [previewPerimeter, setPreviewPerimeter] = useState<Array<{ x: number; y: number }>>([]);
+  const [traceWarning, setTraceWarning] = useState<string | null>(null);
 
   const originalImgRef = useRef<HTMLImageElement>(null);
   const processTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -117,14 +118,26 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
       setProcessedResult(res);
       setAiProgress(null);
 
-      // High-precision perimeter extraction (1024px, alpha >= 16) from the background-removed image
+      // High-precision perimeter extraction (1024px, adaptive alpha threshold) from the background-removed image
       try {
-        const tightPoints = await extractArtworkPerimeter(res.dataUrl, 1024, 16);
-        if (tightPoints && tightPoints.length >= 3) {
-          setPreviewPerimeter(tightPoints);
+        const traceResult = await extractArtworkPerimeter(res.dataUrl, 1024, 16);
+        if (traceResult.points && traceResult.points.length >= 3) {
+          setPreviewPerimeter(traceResult.points);
+          setTraceWarning(null);
+        } else {
+          // Tracing returned empty — show diagnostic warning instead of silently falling back
+          const diag = traceResult.diagnostics;
+          const msg = diag
+            ? `Contour trace produced no outline (threshold: ${diag.thresholdUsed}, transparency: ${Math.round(diag.transparentPixelRatio * 100)}%, retries: ${diag.retryCount}). The image may be fully transparent or too small.`
+            : 'Contour trace produced no outline. The image may be fully transparent or too small.';
+          console.warn('BackgroundRemovalModal:', msg);
+          setTraceWarning(msg);
+          setPreviewPerimeter([]);
         }
       } catch (traceErr) {
-        console.warn('Perimeter tracing fallback:', traceErr);
+        console.warn('Perimeter tracing error:', traceErr);
+        setTraceWarning(`Contour tracing failed: ${traceErr instanceof Error ? traceErr.message : 'unknown error'}`);
+        setPreviewPerimeter([]);
       }
     } catch (err) {
       console.error('Background removal failed:', err);
@@ -159,11 +172,10 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
 
   if (!isOpen) return null;
 
-  // Active cutline perimeter: uses tight traced perimeter from cleaned image when available
-  const activePerimeter =
-    previewPerimeter.length >= 3
-      ? previewPerimeter
-      : asset.originalPerimeterPoints || asset.perimeterPoints || [];
+  // Active cutline perimeter: uses tight traced perimeter from cleaned image only.
+  // Intentionally does NOT fall back to asset.originalPerimeterPoints / asset.perimeterPoints
+  // because those represent the pre-removal outline and would be incorrect after background removal.
+  const activePerimeter = previewPerimeter.length >= 3 ? previewPerimeter : [];
 
   const isInclusive = asset.sizingMode !== 'artwork_only';
   const offsetReduction = contourConfig.enabled ? effectiveOffsetMm * 2 : 0;
@@ -187,10 +199,9 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
 
   const handleApply = async (directExportFormat?: 'cm5_svg' | 'prod_pdf') => {
     if (!processedResult) return;
-    const finalPerimeter =
-      previewPerimeter.length >= 3
-        ? previewPerimeter
-        : asset.originalPerimeterPoints || asset.perimeterPoints || [];
+    // Use only the freshly traced perimeter from the background-removed image.
+    // Do NOT fall back to pre-removal perimeter — that would produce incorrect cut lines.
+    const finalPerimeter = previewPerimeter.length >= 3 ? previewPerimeter : [];
 
     // 1. Update project contour configuration
     updateContourConfig({
@@ -736,6 +747,30 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
                 </div>
               </div>
             </div>
+
+            {/* Contour trace warning */}
+            {traceWarning && (
+              <div
+                style={{
+                  padding: '10px 14px',
+                  borderRadius: '8px',
+                  backgroundColor: '#2a1a00',
+                  border: '1px solid #6b4a00',
+                  fontSize: '11px',
+                  color: '#f59e0b',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                }}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                  <line x1="12" y1="9" x2="12" y2="13" />
+                  <line x1="12" y1="17" x2="12.01" y2="17" />
+                </svg>
+                <span>{traceWarning}</span>
+              </div>
+            )}
 
             {/* Status bar */}
             {processedResult && (

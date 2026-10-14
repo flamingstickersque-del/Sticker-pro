@@ -37,7 +37,8 @@ export const ArtworkManagerStep: React.FC = () => {
       const dims = parseSvgDimensions(text);
       const formattedSvg = formatSvgWithExplicitDimensions(text);
       const dataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(formattedSvg)}`;
-      const perimeterPoints = await extractArtworkPerimeter(dataUrl, 1024, 16);
+      const perimeterResult = await extractArtworkPerimeter(dataUrl, 1024, 16);
+      const perimeterPoints = perimeterResult.points;
 
       const targetDim = 76.2; // 3.00 inches standard
       const isWider = dims.aspectRatio >= 1.0;
@@ -107,7 +108,8 @@ export const ArtworkManagerStep: React.FC = () => {
           const defaultW = isWider ? targetDim : Math.round(targetDim * aspect * 10) / 10;
           const defaultH = isWider ? Math.round((targetDim / aspect) * 10) / 10 : targetDim;
           const effDpi = img.width / (defaultW / 25.4);
-          const perimeterPoints = await extractArtworkPerimeter(dataUrl, 1024, 16);
+          const perimeterResult = await extractArtworkPerimeter(dataUrl, 1024, 16);
+          const perimeterPoints = perimeterResult.points;
 
           const newAsset: ArtworkAsset = {
             id: `asset_${Date.now()}`,
@@ -162,9 +164,9 @@ export const ArtworkManagerStep: React.FC = () => {
       // Extract tight perimeter tracing from the cleaned graphic at 1024px resolution
       let finalPerimeter = asset.perimeterPoints;
       try {
-        const tightPoints = await extractArtworkPerimeter(res.dataUrl, 1024, 16);
-        if (tightPoints && tightPoints.length >= 3) {
-          finalPerimeter = tightPoints;
+        const traceResult = await extractArtworkPerimeter(res.dataUrl, 1024, 16);
+        if (traceResult.points && traceResult.points.length >= 3) {
+          finalPerimeter = traceResult.points;
         }
       } catch (traceErr) {
         console.warn('Quick trace perimeter error:', traceErr);
