@@ -128,7 +128,9 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
           // Tracing returned empty — show diagnostic warning instead of silently falling back
           const diag = traceResult.diagnostics;
           const msg = diag
-            ? `Contour trace produced no outline (threshold: ${diag.thresholdUsed}, transparency: ${Math.round(diag.transparentPixelRatio * 100)}%, retries: ${diag.retryCount}). The image may be fully transparent or too small.`
+            ? `Contour trace produced no outline (alpha ≥ ${diag.alphaThresholdHigh}, transparency: ${Math.round(
+                diag.transparentPixelRatio * 100
+              )}%, components: ${diag.componentCount}). The image may be fully transparent or too small.`
             : 'Contour trace produced no outline. The image may be fully transparent or too small.';
           console.warn('BackgroundRemovalModal:', msg);
           setTraceWarning(msg);
@@ -217,6 +219,10 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
       dataUrl: processedResult.dataUrl,
       fileType: 'image/png',
       svgContent: undefined,
+      originalWidthPx: processedResult.width,
+      originalHeightPx: processedResult.height,
+      aspectRatio:
+        processedResult.height > 0 ? processedResult.width / processedResult.height : asset.aspectRatio,
       perimeterPoints: finalPerimeter,
       originalPerimeterPoints: finalPerimeter,
       smoothing: effectiveSmoothing,
@@ -249,6 +255,12 @@ export const BackgroundRemovalModal: React.FC<Props> = ({
           dataUrl: processedResult.dataUrl,
           fileType: 'image/png',
           svgContent: undefined,
+          originalWidthPx: processedResult.width,
+          originalHeightPx: processedResult.height,
+          aspectRatio:
+            processedResult.height > 0
+              ? processedResult.width / processedResult.height
+              : asset.aspectRatio,
           perimeterPoints: finalPerimeter,
           originalPerimeterPoints: finalPerimeter,
           smoothing: effectiveSmoothing,

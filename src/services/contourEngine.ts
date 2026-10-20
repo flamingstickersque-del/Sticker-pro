@@ -1,4 +1,4 @@
-/**
+﻿/**
  * COMMERCIAL-GRADE CONTOUR GENERATION & VECTOR CUTLINE ENGINE
  * 
  * Produces commercial prepress-grade, silky-smooth vector cut paths:
@@ -14,6 +14,27 @@
 
 import paper from 'paper';
 import { ContourConfig } from '../types';
+import {
+  extractSilhouetteFromImageData,
+  isFullFrameSilhouette,
+  simplifyPolygon,
+  simplifyClosedPolygon,
+  removeCollinearVertices,
+  dedupePolygon,
+  signedArea,
+  type SilhouetteDiagnostics,
+} from './silhouetteExtractor';
+
+export {
+  extractSilhouetteFromImageData,
+  isFullFrameSilhouette,
+  simplifyPolygon,
+  simplifyClosedPolygon,
+  removeCollinearVertices,
+  dedupePolygon,
+  signedArea,
+};
+export type { SilhouetteDiagnostics };
 
 export interface Point2D {
   x: number;
@@ -206,36 +227,18 @@ export function removeClusteredNodes(pts: Point2D[], minDistanceMm: number): Poi
 
 /**
  * Detects whether a set of 2D perimeter points represents a continuous circle
- * (e.g. a round sticker or badge) within a tight radial tolerance (CV < 2.5%).
+ * (e.g. a round sticker or badge) within a tight radial tolerance.
+ *
+ * The circle centre and radius are taken from the bounding box rather than the
+ * mean of the sampled vertices: a pixel-traced boundary is a staircase whose
+ * vertex distribution is not uniform, so the mean radius is systematically
+ * smaller than the true radius.
  */
 export function detectPerfectCircle(
   pts: Point2D[],
   tolerance = 0.025
 ): { isCircle: boolean; cx: number; cy: number; radiusMm: number } | null {
   if (pts.length < 8) return null;
-
-  let sumX = 0;
-  let sumY = 0;
-  for (const p of pts) {
-    sumX += p.x;
-    sumY += p.y;
-  }
-  const cx = sumX / pts.length;
-  const cy = sumY / pts.length;
-
-  const radii = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
-  const meanR = radii.reduce((a, b) => a + b, 0) / radii.length;
-  if (meanR < 1.0) return null;
-
-  let variance = 0;
-  let maxDev = 0;
-  for (const r of radii) {
-    const dev = Math.abs(r - meanR);
-    variance += dev * dev;
-    if (dev > maxDev) maxDev = dev;
-  }
-  const stdDev = Math.sqrt(variance / radii.length);
-  const cv = stdDev / meanR;
 
   let minX = Infinity;
   let maxX = -Infinity;
@@ -249,14 +252,32 @@ export function detectPerfectCircle(
   }
   const w = maxX - minX;
   const h = maxY - minY;
-  const aspectDev = Math.abs(w - h) / Math.max(w, h);
+  if (w <= 1e-9 || h <= 1e-9) return null;
 
-  if (cv <= tolerance && aspectDev <= tolerance * 1.5 && maxDev / meanR <= tolerance * 2) {
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const radiusMm = Math.max(w, h) / 2;
+  if (radiusMm < 1.0) return null;
+
+  const aspectDev = Math.abs(w - h) / Math.max(w, h);
+  if (aspectDev > tolerance * 1.5) return null;
+
+  let variance = 0;
+  let maxDev = 0;
+  for (const p of pts) {
+    const dev = Math.abs(Math.hypot(p.x - cx, p.y - cy) - radiusMm);
+    variance += dev * dev;
+    if (dev > maxDev) maxDev = dev;
+  }
+  const stdDev = Math.sqrt(variance / pts.length);
+  const cv = stdDev / radiusMm;
+
+  if (cv <= tolerance && maxDev / radiusMm <= tolerance * 2) {
     return {
       isCircle: true,
       cx,
       cy,
-      radiusMm: meanR,
+      radiusMm,
     };
   }
 
@@ -264,9 +285,17 @@ export function detectPerfectCircle(
 }
 
 /**
- * Robust mathematical polygon offset:
- * Expands edges outward by offsetMm. Applies smooth circular arcs on convex turns
- * and exact line intersections on concave turns (guaranteeing zero inward intrusion).
+ * Robust polygon offset (outward expansion) for cutline generation.
+ *
+ * Strategy:
+ *  - Every vertex is offset along the angle bisector of its two edge normals.
+ *  - Convex turns get a circular arc (round), a miter (clamped by miterLimit) or
+ *    a bevel; concave turns get the exact bisector intersection.
+ *  - The raw offset is then validated: any residual self-intersection is repaired
+ *    by keeping the largest-area loop, and the result is re-checked.
+ *
+ * The offset is applied to a polygon that has already been simplified, so the
+ * bisector construction is numerically stable and never produces spikes.
  */
 export function offsetPolygon(
   pts: Point2D[],
@@ -277,11 +306,10 @@ export function offsetPolygon(
   if (pts.length < 3) return pts;
   if (Math.abs(offset) < 0.001) return [...pts];
 
-  // Enforce clockwise winding (Y down)
-  let polygon = [...pts];
-  if (polygonSignedArea(polygon) < 0) {
-    polygon.reverse();
-  }
+  // Enforce clockwise winding (Y down) so outward normals point away from the shape.
+  let polygon = dedupePolygon([...pts], 1e-4);
+  if (polygon.length < 3) return [...pts];
+  if (signedArea(polygon) < 0) polygon.reverse();
 
   const N = polygon.length;
   const offsetPts: Point2D[] = [];
@@ -291,17 +319,21 @@ export function offsetPolygon(
     const curr = polygon[i];
     const next = polygon[(i + 1) % N];
 
-    // Edge 1: prev -> curr
     const e1x = curr.x - prev.x;
     const e1y = curr.y - prev.y;
-    const len1 = Math.hypot(e1x, e1y) || 1e-6;
-    const n1x = e1y / len1;
-    const n1y = -e1x / len1;
-
-    // Edge 2: curr -> next
+    const len1 = Math.hypot(e1x, e1y);
     const e2x = next.x - curr.x;
     const e2y = next.y - curr.y;
-    const len2 = Math.hypot(e2x, e2y) || 1e-6;
+    const len2 = Math.hypot(e2x, e2y);
+
+    if (len1 < 1e-9 || len2 < 1e-9) {
+      offsetPts.push({ x: curr.x, y: curr.y });
+      continue;
+    }
+
+    // Outward normals for clockwise winding in Y-down space.
+    const n1x = e1y / len1;
+    const n1y = -e1x / len1;
     const n2x = e2y / len2;
     const n2y = -e2x / len2;
 
@@ -316,8 +348,8 @@ export function offsetPolygon(
         while (angle2 < angle1) angle2 += Math.PI * 2;
         const arcAngle = angle2 - angle1;
 
-        if (arcAngle > 0.05 && arcAngle < Math.PI * 1.8) {
-          const steps = Math.min(8, Math.max(2, Math.ceil(arcAngle / (Math.PI / 4))));
+        if (arcAngle > 0.02 && arcAngle < Math.PI * 1.9) {
+          const steps = Math.min(10, Math.max(2, Math.ceil(arcAngle / (Math.PI / 6))));
           for (let s = 0; s <= steps; s++) {
             const a = angle1 + (arcAngle * s) / steps;
             offsetPts.push({
@@ -332,35 +364,55 @@ export function offsetPolygon(
         const denom = 1 + dotNormals;
         const miterRatio = denom > 1e-4 ? Math.sqrt(2 / denom) : miterLimit + 1;
         if (miterRatio <= miterLimit && denom > 1e-4) {
-          const mx = (n1x + n2x) / denom;
-          const my = (n1y + n2y) / denom;
-          offsetPts.push({ x: curr.x + mx * offset, y: curr.y + my * offset });
+          offsetPts.push({
+            x: curr.x + ((n1x + n2x) / denom) * offset,
+            y: curr.y + ((n1y + n2y) / denom) * offset,
+          });
         } else {
           offsetPts.push({ x: curr.x + n1x * offset, y: curr.y + n1y * offset });
           offsetPts.push({ x: curr.x + n2x * offset, y: curr.y + n2y * offset });
         }
       } else {
-        // Bevel
         offsetPts.push({ x: curr.x + n1x * offset, y: curr.y + n1y * offset });
         offsetPts.push({ x: curr.x + n2x * offset, y: curr.y + n2y * offset });
       }
     } else {
-      // Concave corner: exact line intersection between parallel offset lines
+      // Concave (or inward) turn: exact bisector intersection of the offset edges.
       const denom = 1 + dotNormals;
-      if (denom > 0.15) {
-        const mx = (n1x + n2x) / denom;
-        const my = (n1y + n2y) / denom;
-        offsetPts.push({ x: curr.x + mx * offset, y: curr.y + my * offset });
+      if (denom > 0.05) {
+        offsetPts.push({
+          x: curr.x + ((n1x + n2x) / denom) * offset,
+          y: curr.y + ((n1y + n2y) / denom) * offset,
+        });
       } else {
-        let bx = (n1x + n2x) / 2;
-        let by = (n1y + n2y) / 2;
-        const blen = Math.hypot(bx, by) || 1;
-        offsetPts.push({ x: curr.x + (bx / blen) * offset, y: curr.y + (by / blen) * offset });
+        // Near-180° reversal: clamp the bisector length to avoid a spike.
+        let bx = n1x + n2x;
+        let by = n1y + n2y;
+        const blen = Math.hypot(bx, by);
+        if (blen < 1e-9) {
+          offsetPts.push({ x: curr.x + n1x * offset, y: curr.y + n1y * offset });
+        } else {
+          const clamp = Math.min(miterLimit, 1 / Math.max(blen, 1e-9));
+          offsetPts.push({
+            x: curr.x + (bx / blen) * offset * clamp,
+            y: curr.y + (by / blen) * offset * clamp,
+          });
+        }
       }
     }
   }
 
-  return removePolygonLoops(offsetPts);
+  let result = dedupePolygon(offsetPts, 1e-4);
+
+  // Repair any residual self-intersection introduced by tight concave regions.
+  let guard = 0;
+  while (countPolygonSelfIntersections(result) > 0 && guard++ < 8) {
+    const repaired = removePolygonLoops(result);
+    if (repaired.length < 3 || repaired.length === result.length) break;
+    result = repaired;
+  }
+
+  return result;
 }
 
 /**
@@ -443,357 +495,191 @@ export function validateContourEnclosure(
 }
 
 /**
- * Fits high-grade cubic Bézier curves through points using Paper.js,
- * preserving sharp corners (> 45°) and automatically validating that the
- * smoothed curve NEVER cuts into the artwork silhouette.
+ * Builds a closed linear SVG path from a polygon.
+ */
+export function buildPolygonPath(pts: Point2D[]): string {
+  if (pts.length < 3) return '';
+  let d = `M ${pts[0].x.toFixed(3)} ${pts[0].y.toFixed(3)}`;
+  for (let i = 1; i < pts.length; i++) {
+    d += ` L ${pts[i].x.toFixed(3)} ${pts[i].y.toFixed(3)}`;
+  }
+  return `${d} Z`;
+}
+
+/**
+ * Corner-preserving cubic Bézier fitting.
+ *
+ * Each vertex becomes a smooth node whose tangent follows the chord between its
+ * neighbours, scaled by the smoothing factor. Handles are clamped to a fraction
+ * of the adjacent segment lengths (chord-length parameterisation) so the curve
+ * can never overshoot the polygon — the classic cause of a cutline that bulges
+ * past the artwork or exceeds the configured physical size.
+ *
+ * Vertices whose turn angle exceeds the corner threshold keep zero-length
+ * handles so genuine decorative corners stay sharp.
+ *
+ * The result is validated against the artwork silhouette; if the curve would
+ * cut into the artwork the caller retries with gentler smoothing and finally
+ * falls back to the exact polygon.
  */
 export function fitPaperJsBezierPath(
   points: Point2D[],
   smoothing: number,
   cornerStyle: 'round' | 'miter' | 'bevel' = 'round',
-  artworkPts?: Point2D[]
+  artworkPts?: Point2D[],
+  enclosureToleranceMm = 0.05
 ): string {
   const n = points.length;
   if (n < 3) return '';
 
-  const buildLinearPath = (pts: Point2D[]): string => {
-    let d = `M ${pts[0].x.toFixed(3)} ${pts[0].y.toFixed(3)}`;
-    for (let i = 1; i < pts.length; i++) {
-      d += ` L ${pts[i].x.toFixed(3)} ${pts[i].y.toFixed(3)}`;
-    }
-    d += ' Z';
-    return d;
-  };
-
-  if (smoothing <= 0.05) {
-    return buildLinearPath(points);
+  const clampedSmooth = Math.max(0, Math.min(1, smoothing));
+  if (clampedSmooth <= 0.05) {
+    return buildPolygonPath(points);
   }
 
-  try {
-    const scope = new paper.PaperScope();
-    scope.setup(new paper.Size(1000, 1000));
+  // Corner threshold: sharper turns stay sharp. Round corners tolerate more.
+  const cornerThresholdDeg = cornerStyle === 'round' ? 62 : 45;
+  const tension = 0.5 * clampedSmooth;
 
-    const path = new scope.Path();
-    for (const pt of points) {
-      path.add(new scope.Point(pt.x, pt.y));
+  const isCorner = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const prev = points[(i - 1 + n) % n];
+    const curr = points[i];
+    const next = points[(i + 1) % n];
+    const v1x = curr.x - prev.x;
+    const v1y = curr.y - prev.y;
+    const v2x = next.x - curr.x;
+    const v2y = next.y - curr.y;
+    const l1 = Math.hypot(v1x, v1y);
+    const l2 = Math.hypot(v2x, v2y);
+    if (l1 < 1e-9 || l2 < 1e-9) {
+      isCorner[i] = 1;
+      continue;
     }
-    path.closed = true;
-
-    const clampedSmooth = Math.max(0, Math.min(1, smoothing));
-    // Safe simplification tolerance: 0.02mm to 0.16mm
-    const simplifyTolerance = Math.max(0.02, 0.03 + clampedSmooth * 0.13);
-    path.simplify(simplifyTolerance);
-
-    const segs = path.segments;
-    const segCount = segs.length;
-
-    for (let i = 0; i < segCount; i++) {
-      const seg = segs[i];
-      const prev = segs[(i - 1 + segCount) % segCount];
-      const next = segs[(i + 1) % segCount];
-
-      const v1 = seg.point.subtract(prev.point);
-      const v2 = next.point.subtract(seg.point);
-      const l1 = v1.length;
-      const l2 = v2.length;
-
-      if (l1 > 1e-4 && l2 > 1e-4) {
-        const dot = v1.x * v2.x + v1.y * v2.y;
-        const cosTurn = Math.max(-1, Math.min(1, dot / (l1 * l2)));
-        const turnAngleDeg = Math.acos(cosTurn) * (180 / Math.PI);
-
-        // Turn angle > 45 degrees: maintain sharp geometric corner with 0 handles
-        if (turnAngleDeg > 45 && cornerStyle !== 'round') {
-          seg.handleIn = new scope.Point(0, 0);
-          seg.handleOut = new scope.Point(0, 0);
-        } else if (clampedSmooth > 0.15 && turnAngleDeg <= 45) {
-          // Use Paper.js segment.smooth with valid catmull-rom algorithm
-          seg.smooth({ type: 'catmull-rom', factor: Math.min(0.5, clampedSmooth * 0.45) });
-        }
-      }
-    }
-
-    const svgPath = path.pathData;
-    if (svgPath && svgPath.length > 5) {
-      // Validate enclosure if artwork points provided
-      if (artworkPts && artworkPts.length > 0) {
-        const val = validateContourEnclosure(svgPath, artworkPts, 0.05);
-        if (!val.isValid) {
-          // Recovery: use exact enclosing polygon
-          return buildLinearPath(points);
-        }
-      }
-      return svgPath.replace(/z\s*$/, 'Z');
-    }
-  } catch (err) {
-    console.warn('Paper.js curve fitting fallback:', err);
+    const cosTurn = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (l1 * l2)));
+    const turnDeg = Math.acos(cosTurn) * (180 / Math.PI);
+    if (turnDeg > cornerThresholdDeg) isCorner[i] = 1;
   }
 
-  return buildLinearPath(points);
+  const fmt = (v: number) => v.toFixed(3);
+  let d = `M ${fmt(points[0].x)} ${fmt(points[0].y)}`;
+
+  for (let i = 0; i < n; i++) {
+    const curr = points[i];
+    const next = points[(i + 1) % n];
+
+    if (isCorner[i] || isCorner[(i + 1) % n]) {
+      d += ` L ${fmt(next.x)} ${fmt(next.y)}`;
+      continue;
+    }
+
+    const prev = points[(i - 1 + n) % n];
+    const afterNext = points[(i + 2) % n];
+
+    const segLen = Math.hypot(next.x - curr.x, next.y - curr.y);
+    if (segLen < 1e-9) {
+      d += ` L ${fmt(next.x)} ${fmt(next.y)}`;
+      continue;
+    }
+
+    // Tangent directions from the neighbouring chords.
+    let t1x = next.x - prev.x;
+    let t1y = next.y - prev.y;
+    let t2x = afterNext.x - curr.x;
+    let t2y = afterNext.y - curr.y;
+
+    const l1 = Math.hypot(t1x, t1y) || 1;
+    const l2 = Math.hypot(t2x, t2y) || 1;
+    t1x /= l1;
+    t1y /= l1;
+    t2x /= l2;
+    t2y /= l2;
+
+    // Chord-length parameterisation: handles never exceed 1/3 of the segment,
+    // which keeps the cubic inside the convex hull of its control points.
+    const maxHandle = segLen / 3;
+    const h1 = Math.min(maxHandle, (segLen * tension) / 2);
+    const h2 = Math.min(maxHandle, (segLen * tension) / 2);
+
+    const c1x = curr.x + t1x * h1;
+    const c1y = curr.y + t1y * h1;
+    const c2x = next.x - t2x * h2;
+    const c2y = next.y - t2y * h2;
+
+    d += ` C ${fmt(c1x)} ${fmt(c1y)} ${fmt(c2x)} ${fmt(c2y)} ${fmt(next.x)} ${fmt(next.y)}`;
+  }
+
+  d += ' Z';
+
+  if (artworkPts && artworkPts.length > 0) {
+    const val = validateContourEnclosure(d, artworkPts, enclosureToleranceMm);
+    if (!val.isValid) return buildPolygonPath(points);
+  }
+
+  return d;
 }
 
 /**
- * Analyzes artwork raster/vector image and extracts STRICTLY its outermost perimeter
- * silhouette as a normalized polygon with coordinates in range [-0.5..0.5, -0.5..0.5].
- * 
- * Uses a padded canvas with exterior BFS flood-fill and Moore-Neighbor boundary tracing,
- * ensuring complete outer silhouette extraction with all interior cavities (holes in handles,
- * letter counters) solidly preserved as foreground.
+ * Extracts the artwork's true outer silhouette from a background-removed image.
+ *
+ * The image is rasterised onto a padded canvas (so the artwork never touches the
+ * sampling border), then handed to the deterministic silhouette pipeline in
+ * `silhouetteExtractor`, which performs alpha hysteresis, component selection,
+ * noise removal, component bridging and boundary tracing.
+ *
+ * Returns normalised points in [-0.5..0.5] relative to the artwork canvas.
  */
 export interface PerimeterTraceResult {
   points: Point2D[];
-  /** Human-readable diagnostic info for debugging */
-  diagnostics?: {
-    thresholdUsed: number;
-    transparentPixelRatio: number;
-    method: 'alpha' | 'color_diff' | 'none';
-    retryCount: number;
-  };
+  diagnostics?: SilhouetteDiagnostics;
 }
 
-/**
- * Core perimeter extraction logic shared across retry attempts.
- * @returns Traced boundary points in normalized [-0.5..0.5] coordinates, or null on failure.
- */
-function tracePerimeterFromImageData(
-  data: Uint8ClampedArray,
-  paddedW: number,
-  paddedH: number,
-  padding: number,
-  W: number,
-  H: number,
-  alphaThreshold: number
-): Point2D[] | null {
-  const totalPixels = paddedW * paddedH;
-
-  // 1. Detect transparency & create binary grid
-  let transparentCount = 0;
-  for (let i = 3; i < data.length; i += 4) {
-    if (data[i] < alphaThreshold) transparentCount++;
-  }
-
-  const hasAlpha = transparentCount > 10;
-  const rawGrid = new Uint8Array(totalPixels);
-
-  if (hasAlpha) {
-    for (let i = 0; i < totalPixels; i++) {
-      rawGrid[i] = data[i * 4 + 3] >= alphaThreshold ? 1 : 0;
-    }
-  } else {
-    // Solid substrate without alpha: sample outer border to establish background
-    const c1 = [data[0], data[1], data[2]];
-    const c2 = [data[(paddedW - 1) * 4], data[(paddedW - 1) * 4 + 1], data[(paddedW - 1) * 4 + 2]];
-    const c3 = [data[(paddedH - 1) * paddedW * 4], data[(paddedH - 1) * paddedW * 4 + 1], data[(paddedH - 1) * paddedW * 4 + 2]];
-    const c4 = [data[(paddedH * paddedW - 1) * 4], data[(paddedH * paddedW - 1) * 4 + 1], data[(paddedH * paddedW - 1) * 4 + 2]];
-    const bgR = (c1[0] + c2[0] + c3[0] + c4[0]) / 4;
-    const bgG = (c1[1] + c2[1] + c3[1] + c4[1]) / 4;
-    const bgB = (c1[2] + c2[2] + c3[2] + c4[2]) / 4;
-
-    for (let i = 0; i < totalPixels; i++) {
-      const r = data[i * 4];
-      const g = data[i * 4 + 1];
-      const b = data[i * 4 + 2];
-      const diff = Math.hypot(r - bgR, g - bgG, b - bgB);
-      rawGrid[i] = diff > 30 ? 1 : 0;
-    }
-  }
-
-  // 2. EXTERIOR FLOOD-FILL (BFS)
-  // Starts from all outer borders of the padded canvas
-  const visitedExterior = new Uint8Array(totalPixels);
-  const queue: number[] = [];
-
-  for (let x = 0; x < paddedW; x++) {
-    const topIdx = x;
-    const btmIdx = (paddedH - 1) * paddedW + x;
-    if (rawGrid[topIdx] === 0 && visitedExterior[topIdx] === 0) {
-      visitedExterior[topIdx] = 1;
-      queue.push(topIdx);
-    }
-    if (rawGrid[btmIdx] === 0 && visitedExterior[btmIdx] === 0) {
-      visitedExterior[btmIdx] = 1;
-      queue.push(btmIdx);
-    }
-  }
-  for (let y = 0; y < paddedH; y++) {
-    const leftIdx = y * paddedW;
-    const rightIdx = y * paddedW + (paddedW - 1);
-    if (rawGrid[leftIdx] === 0 && visitedExterior[leftIdx] === 0) {
-      visitedExterior[leftIdx] = 1;
-      queue.push(leftIdx);
-    }
-    if (rawGrid[rightIdx] === 0 && visitedExterior[rightIdx] === 0) {
-      visitedExterior[rightIdx] = 1;
-      queue.push(rightIdx);
-    }
-  }
-
-  let qHead = 0;
-  while (qHead < queue.length) {
-    const idx = queue[qHead++];
-    const qx = idx % paddedW;
-    const qy = Math.floor(idx / paddedW);
-
-    const neighbors = [
-      [qx - 1, qy],
-      [qx + 1, qy],
-      [qx, qy - 1],
-      [qx, qy + 1],
-    ];
-
-    for (const [nx, ny] of neighbors) {
-      if (nx >= 0 && nx < paddedW && ny >= 0 && ny < paddedH) {
-        const nIdx = ny * paddedW + nx;
-        if (rawGrid[nIdx] === 0 && visitedExterior[nIdx] === 0) {
-          visitedExterior[nIdx] = 1;
-          queue.push(nIdx);
-        }
-      }
-    }
-  }
-
-  // 3. Create strictly solid outer silhouette
-  const solidGrid = new Uint8Array(totalPixels);
-  let firstX = -1;
-  let firstY = -1;
-
-  for (let y = 0; y < paddedH; y++) {
-    for (let x = 0; x < paddedW; x++) {
-      const idx = y * paddedW + x;
-      if (visitedExterior[idx] === 0) {
-        solidGrid[idx] = 1;
-        if (firstX === -1) {
-          firstX = x;
-          firstY = y;
-        }
-      }
-    }
-  }
-
-  if (firstX === -1 || firstY === -1) {
-    return null;
-  }
-
-  // 4. Moore-Neighbor boundary tracing with Jacob's stopping condition
-  const DIRS: [number, number][] = [
-    [0, -1],  // 0: N
-    [1, -1],  // 1: NE
-    [1, 0],   // 2: E
-    [1, 1],   // 3: SE
-    [0, 1],   // 4: S
-    [-1, 1],  // 5: SW
-    [-1, 0],  // 6: W
-    [-1, -1], // 7: NW
-  ];
-
-  const boundary: Point2D[] = [];
-  let currX = firstX;
-  let currY = firstY;
-  let startDir = 6; // searching clockwise starting from West
-  let secondPt: Point2D | null = null;
-  let maxSteps = 30000;
-
-  boundary.push({ x: currX + 0.5, y: currY + 0.5 });
-
-  while (maxSteps-- > 0) {
-    let found = false;
-    for (let i = 0; i < 8; i++) {
-      const d = (startDir + i) % 8;
-      const nx = currX + DIRS[d][0];
-      const ny = currY + DIRS[d][1];
-
-      if (nx >= 0 && nx < paddedW && ny >= 0 && ny < paddedH && solidGrid[ny * paddedW + nx] === 1) {
-        currX = nx;
-        currY = ny;
-        startDir = (d + 5) % 8;
-        const pt = { x: currX + 0.5, y: currY + 0.5 };
-        boundary.push(pt);
-        found = true;
-
-        if (boundary.length === 2) {
-          secondPt = pt;
-        }
-        break;
-      }
-    }
-
-    if (!found) break;
-
-    // Jacob's stopping condition
-    if (
-      boundary.length > 3 &&
-      currX === firstX &&
-      currY === firstY &&
-      secondPt &&
-      boundary[1].x === secondPt.x &&
-      boundary[1].y === secondPt.y
-    ) {
-      break;
-    }
-  }
-
-  if (boundary.length < 4) {
-    return null;
-  }
-
-  // Remove duplicate closure point if present
-  const last = boundary[boundary.length - 1];
-  const first = boundary[0];
-  if (last.x === first.x && last.y === first.y) {
-    boundary.pop();
-  }
-
-  // 5. Convert back from padded coordinates to normalized [-0.5..0.5]
-  const normalized: Point2D[] = boundary.map((p) => ({
-    x: Math.max(-0.5, Math.min(0.5, (p.x - padding) / W - 0.5)),
-    y: Math.max(-0.5, Math.min(0.5, (p.y - padding) / H - 0.5)),
-  }));
-
-  // 6. Ensure clockwise winding (Y down)
-  let pts = normalized;
-  if (polygonSignedArea(pts) < 0) {
-    pts = [...pts].reverse();
-  }
-
-  // 7. Simplify collinear points and remove clustered micro-nodes
-  const rdpEps = Math.max(0.0005, 0.001);
-  let simplified = ramerDouglasPeucker(pts, rdpEps);
-  if (simplified.length < 4) {
-    simplified = pts;
-  }
-  simplified = removeClusteredNodes(simplified, 0.001);
-  simplified = removePolygonLoops(simplified);
-
-  return simplified;
+export interface ExtractPerimeterOptions {
+  /** Sampling resolution of the longest edge (px). */
+  sampleSize?: number;
+  /** Transparent padding around the artwork (px) so it never touches the border. */
+  padding?: number;
+  /** Physical width of the artwork in mm, used to derive a mm-accurate tolerance. */
+  physicalSizeMm?: number;
+  /** Simplification tolerance in mm. */
+  toleranceMm?: number;
 }
 
-/**
- * Analyzes artwork raster/vector image and extracts STRICTLY its outermost perimeter
- * silhouette as a normalized polygon with coordinates in range [-0.5..0.5, -0.5..0.5].
- *
- * Uses a padded canvas with exterior BFS flood-fill and Moore-Neighbor boundary tracing,
- * ensuring complete outer silhouette extraction with all interior cavities (holes in handles,
- * letter counters) solidly preserved as foreground.
- *
- * Uses an adaptive alpha-threshold retry cascade to handle soft-edge / anti-aliased images:
- *   1. Try alpha ≥ 16 (crisp edges) → if empty result
- *   2. Retry with alpha ≥ 8 (softer edges) → if empty
- *   3. Retry with alpha ≥ 1 (any non-transparent pixel)
- */
 export function extractArtworkPerimeter(
   srcUrl: string,
-  sampleSize: number = 1024,
-  padding: number = 16
+  sampleSizeOrOptions: number | ExtractPerimeterOptions = 1024,
+  paddingArg = 16
 ): Promise<PerimeterTraceResult> {
+  const options: ExtractPerimeterOptions =
+    typeof sampleSizeOrOptions === 'number'
+      ? { sampleSize: sampleSizeOrOptions, padding: paddingArg }
+      : sampleSizeOrOptions;
+
+  const sampleSize = options.sampleSize ?? 1024;
+  const padding = options.padding ?? 16;
+
   return new Promise<PerimeterTraceResult>((resolve) => {
+    if (typeof document === 'undefined' || typeof Image === 'undefined') {
+      resolve({ points: [] });
+      return;
+    }
+
     try {
       const img = new Image();
       img.crossOrigin = 'anonymous';
 
       img.onload = () => {
         try {
-          const W = sampleSize;
-          const H = Math.round(sampleSize * (img.naturalHeight / Math.max(1, img.naturalWidth)));
+          const naturalW = img.naturalWidth || img.width;
+          const naturalH = img.naturalHeight || img.height;
+          if (!naturalW || !naturalH) {
+            resolve({ points: [] });
+            return;
+          }
+
+          const scale = sampleSize / Math.max(naturalW, naturalH);
+          const W = Math.max(2, Math.round(naturalW * scale));
+          const H = Math.max(2, Math.round(naturalH * scale));
           const paddedW = W + padding * 2;
           const paddedH = H + padding * 2;
 
@@ -807,59 +693,35 @@ export function extractArtworkPerimeter(
             return;
           }
 
+          // Transparent padding: any pixel outside the artwork is fully transparent,
+          // so leftover background can never be mistaken for artwork.
+          ctx.clearRect(0, 0, paddedW, paddedH);
           ctx.drawImage(img, padding, padding, W, H);
+
           const imageData = ctx.getImageData(0, 0, paddedW, paddedH);
-          const data = imageData.data;
 
-          // Adaptive threshold retry cascade for soft-edge / anti-aliased images
-          const thresholds = [16, 8, 1];
-          let points: Point2D[] | null = null;
-          let thresholdUsed = thresholds[0];
-          let retryCount = 0;
+          const result = extractSilhouetteFromImageData(imageData.data, paddedW, paddedH, {
+            physicalSizeMm: options.physicalSizeMm,
+            toleranceMm: options.toleranceMm,
+          });
 
-          for (const t of thresholds) {
-            const result = tracePerimeterFromImageData(data, paddedW, paddedH, padding, W, H, t);
-            if (result !== null && result.length >= 3) {
-              points = result;
-              thresholdUsed = t;
-              break;
-            }
-            retryCount++;
-          }
-
-          // Compute transparency ratio for diagnostics
-          let transparentPixelRatio = 0;
-          for (let i = 3; i < data.length; i += 4) {
-            if (data[i] < thresholdUsed) transparentPixelRatio++;
-          }
-          transparentPixelRatio /= (paddedW * paddedH);
-
-          if (!points || points.length < 3) {
+          if (result.points.length < 3) {
             console.warn(
-              `ContourEngine: Perimeter extraction failed after ${thresholds.length} threshold attempts. ` +
-              `Image may be fully transparent or too small at sample resolution.`
+              'ContourEngine: Silhouette extraction produced no usable outline.',
+              result.diagnostics
             );
-            resolve({
-              points: [],
-              diagnostics: {
-                thresholdUsed,
-                transparentPixelRatio: Math.round(transparentPixelRatio * 100) / 100,
-                method: transparentPixelRatio > 0.05 ? 'alpha' : 'none',
-                retryCount,
-              },
-            });
+            resolve({ points: [], diagnostics: result.diagnostics });
             return;
           }
 
-          resolve({
-            points,
-            diagnostics: {
-              thresholdUsed,
-              transparentPixelRatio: Math.round(transparentPixelRatio * 100) / 100,
-              method: transparentPixelRatio > 0.05 ? 'alpha' : 'color_diff',
-              retryCount,
-            },
-          });
+          // Re-map from padded canvas space to the artwork canvas space so the
+          // normalised coordinates stay aligned with the rendered artwork.
+          const remapped: Point2D[] = result.points.map((p) => ({
+            x: ((p.x + 0.5) * paddedW - padding) / W - 0.5,
+            y: ((p.y + 0.5) * paddedH - padding) / H - 0.5,
+          }));
+
+          resolve({ points: remapped, diagnostics: result.diagnostics });
         } catch (err) {
           console.warn('ContourEngine: Error in perimeter extraction image processing:', err);
           resolve({ points: [] });
@@ -880,9 +742,103 @@ export function extractArtworkPerimeter(
 }
 
 /**
+ * Uniformly scales a polygon about its centre so its bounding box matches the
+ * requested physical size in the dominant dimension.
+ *
+ * Simplification and curve fitting can shave a few hundredths of a millimetre
+ * off the extremes of a contour. Re-fitting the bounding box keeps the
+ * configured sticker preset physically exact without distorting the shape.
+ */
+export function fitPolygonToTargetSize(
+  pts: Point2D[],
+  targetWidthMm: number,
+  targetHeightMm: number
+): Point2D[] {
+  if (pts.length < 3 || targetWidthMm <= 0 || targetHeightMm <= 0) return pts;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+
+  const w = maxX - minX;
+  const h = maxY - minY;
+  if (w <= 1e-9 || h <= 1e-9) return pts;
+
+  // Uniform scale so the shape is never distorted; the dominant axis lands
+  // exactly on the target and the other axis stays within it.
+  const scale = Math.min(targetWidthMm / w, targetHeightMm / h);
+  if (!isFinite(scale) || scale <= 0) return pts;
+
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+
+  return pts.map((p) => ({
+    x: (p.x - cx) * scale,
+    y: (p.y - cy) * scale,
+  }));
+}
+
+/**
+ * Rescales a generated SVG path so its bounding box matches the requested
+ * physical size in the dominant dimension.
+ *
+ * Curve fitting legitimately bulges a fraction of a millimetre past the
+ * polygon it was fitted to. Without this final normalisation the finished
+ * sticker would drift from the configured preset (e.g. 3.00" -> 3.02").
+ */
+export function normalizePathToTargetSize(
+  pathData: string,
+  targetWidthMm: number,
+  targetHeightMm: number,
+  toleranceMm = 0.005
+): string {
+  if (!pathData || targetWidthMm <= 0 || targetHeightMm <= 0) return pathData;
+
+  try {
+    const scope = new paper.PaperScope();
+    scope.setup(new paper.Size(1000, 1000));
+    const path = new scope.Path(pathData);
+    if (!path.closed) path.closed = true;
+
+    const bounds = path.bounds;
+    const w = bounds.width;
+    const h = bounds.height;
+    if (w <= 1e-9 || h <= 1e-9) return pathData;
+
+    // Already within tolerance of the requested size: leave the geometry alone.
+    if (Math.abs(w - targetWidthMm) <= toleranceMm && Math.abs(h - targetHeightMm) <= toleranceMm) {
+      return pathData;
+    }
+
+    const scale = Math.min(targetWidthMm / w, targetHeightMm / h);
+    if (!isFinite(scale) || scale <= 0) return pathData;
+
+    const center = bounds.center;
+    path.scale(scale, center);
+    return path.pathData.replace(/z\s*$/, 'Z');
+  } catch (err) {
+    console.warn('ContourEngine: path size normalisation failed:', err);
+    return pathData;
+  }
+}
+
+/**
  * Creates an offset, simplified, loop-free vector cut contour for a sticker.
- * Produces commercial-grade cubic Bézier paths with Schneider curve fitting via Paper.js,
- * automatically validated to fully enclose the artwork silhouette.
+ *
+ * The cutline is ALWAYS derived from the artwork's traced silhouette. The
+ * rectangular fallback is only used when no silhouette exists at all, and it is
+ * explicitly reported through `contourDiagnostics` so the UI can warn the user.
+ *
+ * Tolerances are adaptive: they scale with the physical size of the sticker
+ * rather than using a fixed pixel constant, so a 3" badge and a 12" decal both
+ * get a cutline that follows the artwork without knife-chattering micro-nodes.
  */
 export function generateContourSvgPath(
   widthMm: number,
@@ -900,41 +856,76 @@ export function generateContourSvgPath(
   const miterLimit = config.miterLimit || 2.5;
 
   if (perimeterPoints && perimeterPoints.length >= 3) {
-    // 1. Scale normalized vertices to physical sticker mm coordinates
+    // 1. Scale normalised vertices to physical sticker mm coordinates.
     const basePts: Point2D[] = perimeterPoints.map((p) => ({
       x: p.x * widthMm,
       y: p.y * heightMm,
     }));
 
-    let pts = basePts;
-    if (polygonSignedArea(pts) < 0) {
-      pts = [...pts].reverse();
-    }
+    let pts = dedupePolygon(basePts, 1e-4);
+    if (pts.length < 3) pts = basePts;
+    if (signedArea(pts) < 0) pts = [...pts].reverse();
 
-    // 2. Circular badge detection: output exact SVG arc
-    const circleInfo = detectPerfectCircle(pts, 0.025);
+    // 2. Adaptive simplification of the traced silhouette BEFORE offsetting.
+    //    Offsetting a pixel staircase amplifies every scallop, so the staircase
+    //    must be removed first. Tolerance scales with the sticker's diagonal.
+    const diagMm = Math.hypot(widthMm, heightMm) || 1;
+    const baseToleranceMm = Math.min(0.35, Math.max(0.02, diagMm * 0.0018));
+    const silhouetteTolerance = baseToleranceMm * (1.6 - smoothing * 0.9);
+
+    let cleaned = simplifyClosedPolygon(pts, silhouetteTolerance);
+    cleaned = removeCollinearVertices(cleaned, silhouetteTolerance * 0.5);
+    cleaned = dedupePolygon(cleaned, Math.max(0.01, silhouetteTolerance * 0.5));
+    if (cleaned.length < 4) cleaned = pts;
+
+    // 3. Circular badge detection: only when the silhouette really is a circle.
+    const circleInfo = detectPerfectCircle(cleaned, 0.03);
     if (circleInfo) {
       const finalRadius = Math.max(0.5, circleInfo.radiusMm + offset);
       const cx = circleInfo.cx;
       const cy = circleInfo.cy;
-      return `M ${cx.toFixed(3)} ${(cy - finalRadius).toFixed(3)} A ${finalRadius.toFixed(3)} ${finalRadius.toFixed(3)} 0 1 0 ${cx.toFixed(3)} ${(cy + finalRadius).toFixed(3)} A ${finalRadius.toFixed(3)} ${finalRadius.toFixed(3)} 0 1 0 ${cx.toFixed(3)} ${(cy - finalRadius).toFixed(3)} Z`;
+      const arcPath = `M ${cx.toFixed(3)} ${(cy - finalRadius).toFixed(3)} A ${finalRadius.toFixed(3)} ${finalRadius.toFixed(3)} 0 1 0 ${cx.toFixed(3)} ${(cy + finalRadius).toFixed(3)} A ${finalRadius.toFixed(3)} ${finalRadius.toFixed(3)} 0 1 0 ${cx.toFixed(3)} ${(cy - finalRadius).toFixed(3)} Z`;
+      return normalizePathToTargetSize(arcPath, widthMm + offset * 2, heightMm + offset * 2);
     }
 
-    // 3. Robust mathematical polygon offset
-    let offsetPts = offsetPolygon(pts, offset, cornerStyle, miterLimit);
+    // 4. Geometric offset of the cleaned silhouette.
+    let offsetPts = offsetPolygon(cleaned, offset, cornerStyle, miterLimit);
+    offsetPts = dedupePolygon(offsetPts, Math.max(0.01, baseToleranceMm * 0.4));
 
-    // 4. Declustering to eliminate knife stutter
-    offsetPts = removeClusteredNodes(offsetPts, 0.12);
+    // 5. Post-offset simplification removes arc/bevel micro-nodes.
+    const offsetTolerance = baseToleranceMm * (1.2 - smoothing * 0.6);
+    let simplified = simplifyClosedPolygon(offsetPts, offsetTolerance);
+    simplified = removeCollinearVertices(simplified, offsetTolerance * 0.5);
+    if (simplified.length < 4) simplified = offsetPts;
 
-    // 5. Pre-simplification for collinear edges
-    const rdpEps = Math.max(0.03, 0.05 + (1 - smoothing) * 0.08);
-    let simplified = ramerDouglasPeucker(offsetPts, rdpEps);
-    if (simplified.length < 4) {
-      simplified = offsetPts;
+    // 6. Restore the exact intended physical size. Simplification and curve
+    //    fitting can shave a few hundredths of a millimetre off the extremes;
+    //    re-fitting the bounding box keeps the 3" preset physically exact.
+    simplified = fitPolygonToTargetSize(simplified, widthMm + offset * 2, heightMm + offset * 2);
+
+    // 7. Curve fitting, validated against the artwork silhouette. If the fitted
+    //    curve would cut into the artwork, retry with gentler smoothing and
+    //    finally fall back to the exact offset polygon.
+    const enclosureTolerance = Math.max(0.02, Math.min(0.15, offset * 0.25));
+    const attempts = [smoothing, smoothing * 0.6, smoothing * 0.3];
+    for (const attempt of attempts) {
+      const candidate = fitPaperJsBezierPath(
+        simplified,
+        attempt,
+        cornerStyle,
+        cleaned,
+        enclosureTolerance
+      );
+      if (candidate && validateContourEnclosure(candidate, cleaned, enclosureTolerance).isValid) {
+        return normalizePathToTargetSize(candidate, widthMm + offset * 2, heightMm + offset * 2);
+      }
     }
 
-    // 6. Safe curve fitting with validation & enclosure recovery
-    return fitPaperJsBezierPath(simplified, smoothing, cornerStyle, pts);
+    return normalizePathToTargetSize(
+      buildPolygonPath(simplified),
+      widthMm + offset * 2,
+      heightMm + offset * 2
+    );
   }
 
   // Fallback: If square dimensions with high smoothing, treat as circular badge
@@ -1073,4 +1064,161 @@ export function formatSvgWithExplicitDimensions(svgString: string): string {
     cleaned = cleaned.replace(/<svg\b/i, `<svg viewBox="0 0 ${dims.width} ${dims.height}"`);
   }
   return cleaned;
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Failed to load image'));
+    img.src = src;
+  });
+}
+
+function alphaBounds(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  threshold = 8
+): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      if (data[(row + x) * 4 + 3] < threshold) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return maxX < minX || maxY < minY ? null : { minX, minY, maxX, maxY };
+}
+
+/**
+ * Crops an SVG's viewBox to its rendered content bounds.
+ *
+ * Artwork files routinely carry transparent padding inside their viewBox. If the
+ * cutline is traced from that padded canvas, the finished sticker is smaller
+ * than the configured physical size. Cropping the viewBox makes the artwork
+ * canvas equal to the artwork silhouette, so a 3" preset really produces a 3"
+ * cut shape.
+ */
+export async function cropSvgToContentBounds(
+  svgString: string,
+  sampleSize = 1024
+): Promise<{ svg: string; width: number; height: number; aspectRatio: number; cropped: boolean }> {
+  const dims = parseSvgDimensions(svgString);
+  const fallback = {
+    svg: svgString,
+    width: dims.width,
+    height: dims.height,
+    aspectRatio: dims.aspectRatio,
+    cropped: false,
+  };
+
+  if (typeof document === 'undefined') return fallback;
+
+  try {
+    const formatted = formatSvgWithExplicitDimensions(svgString);
+    const dataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(formatted)}`;
+    const img = await loadImage(dataUrl);
+
+    const scale = sampleSize / Math.max(dims.width, dims.height);
+    const W = Math.max(2, Math.round(dims.width * scale));
+    const H = Math.max(2, Math.round(dims.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return fallback;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(img, 0, 0, W, H);
+    const bounds = alphaBounds(ctx.getImageData(0, 0, W, H).data, W, H);
+    if (!bounds) return fallback;
+
+    const vbMatch = formatted.match(/viewBox\s*=\s*["']([^"']+)["']/i);
+    const vb = vbMatch ? vbMatch[1].trim().split(/[\s,]+/).map(Number) : [0, 0, dims.width, dims.height];
+    const vbX = vb.length === 4 ? vb[0] : 0;
+    const vbY = vb.length === 4 ? vb[1] : 0;
+    const vbW = vb.length === 4 && vb[2] > 0 ? vb[2] : dims.width;
+    const vbH = vb.length === 4 && vb[3] > 0 ? vb[3] : dims.height;
+
+    const pxToVbX = vbW / W;
+    const pxToVbY = vbH / H;
+
+    const newX = vbX + bounds.minX * pxToVbX;
+    const newY = vbY + bounds.minY * pxToVbY;
+    const newW = (bounds.maxX - bounds.minX + 1) * pxToVbX;
+    const newH = (bounds.maxY - bounds.minY + 1) * pxToVbY;
+
+    if (newW <= 0 || newH <= 0) return fallback;
+
+    const round = (v: number) => Math.round(v * 1000) / 1000;
+    let cropped = formatted
+      .replace(/viewBox\s*=\s*["'][^"']*["']/i, `viewBox="${round(newX)} ${round(newY)} ${round(newW)} ${round(newH)}"`)
+      .replace(/(<svg[^>]*?)\swidth\s*=\s*["'][^"']*["']/i, `$1 width="${round(newW)}"`)
+      .replace(/(<svg[^>]*?)\sheight\s*=\s*["'][^"']*["']/i, `$1 height="${round(newH)}"`);
+
+    return {
+      svg: cropped,
+      width: newW,
+      height: newH,
+      aspectRatio: newW / newH,
+      cropped: true,
+    };
+  } catch (err) {
+    console.warn('ContourEngine: SVG content crop failed:', err);
+    return fallback;
+  }
+}
+
+/**
+ * Crops a raster artwork to its non-transparent content bounds.
+ */
+export async function cropRasterToContentBounds(
+  dataUrl: string
+): Promise<{ dataUrl: string; width: number; height: number; cropped: boolean }> {
+  if (typeof document === 'undefined') {
+    return { dataUrl, width: 0, height: 0, cropped: false };
+  }
+
+  try {
+    const img = await loadImage(dataUrl);
+    const W = img.naturalWidth || img.width;
+    const H = img.naturalHeight || img.height;
+    if (!W || !H) return { dataUrl, width: W, height: H, cropped: false };
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return { dataUrl, width: W, height: H, cropped: false };
+
+    ctx.drawImage(img, 0, 0);
+    const bounds = alphaBounds(ctx.getImageData(0, 0, W, H).data, W, H);
+    if (!bounds) return { dataUrl, width: W, height: H, cropped: false };
+
+    const cropW = bounds.maxX - bounds.minX + 1;
+    const cropH = bounds.maxY - bounds.minY + 1;
+    if (cropW === W && cropH === H) return { dataUrl, width: W, height: H, cropped: false };
+
+    const out = document.createElement('canvas');
+    out.width = cropW;
+    out.height = cropH;
+    const outCtx = out.getContext('2d');
+    if (!outCtx) return { dataUrl, width: W, height: H, cropped: false };
+
+    outCtx.drawImage(canvas, bounds.minX, bounds.minY, cropW, cropH, 0, 0, cropW, cropH);
+    return { dataUrl: out.toDataURL('image/png'), width: cropW, height: cropH, cropped: true };
+  } catch (err) {
+    console.warn('ContourEngine: Raster content crop failed:', err);
+    return { dataUrl, width: 0, height: 0, cropped: false };
+  }
 }

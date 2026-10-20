@@ -6,6 +6,8 @@ import {
   extractArtworkPerimeter,
   parseSvgDimensions,
   formatSvgWithExplicitDimensions,
+  cropSvgToContentBounds,
+  cropRasterToContentBounds,
 } from '../../services/contourEngine';
 import { removeImageBackground } from '../../services/backgroundRemoval';
 import { ArtworkAsset } from '../../types';
@@ -34,8 +36,12 @@ export const ArtworkManagerStep: React.FC = () => {
 
     if (isSvg) {
       const text = await file.text();
-      const dims = parseSvgDimensions(text);
-      const formattedSvg = formatSvgWithExplicitDimensions(text);
+      // Crop the viewBox to the rendered content so the artwork canvas equals
+      // the artwork silhouette; otherwise the traced cutline is smaller than
+      // the configured physical sticker size.
+      const cropped = await cropSvgToContentBounds(text, 1024);
+      const dims = { width: cropped.width, height: cropped.height, aspectRatio: cropped.aspectRatio };
+      const formattedSvg = formatSvgWithExplicitDimensions(cropped.svg);
       const dataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(formattedSvg)}`;
       const perimeterResult = await extractArtworkPerimeter(dataUrl, 1024, 16);
       const perimeterPoints = perimeterResult.points;
@@ -102,12 +108,19 @@ export const ArtworkManagerStep: React.FC = () => {
 
         const img = new Image();
         img.onload = async () => {
-          const aspect = img.width / (img.height || 1);
+          // Crop transparent padding so the artwork canvas equals the artwork
+          // silhouette and the physical size preset applies to the cut shape.
+          const cropped = await cropRasterToContentBounds(dataUrl);
+          if (cropped.cropped) dataUrl = cropped.dataUrl;
+
+          const aspect = cropped.width && cropped.height
+            ? cropped.width / cropped.height
+            : img.width / (img.height || 1);
           const isWider = aspect >= 1.0;
           const targetDim = 76.2; // 3.00 inches standard
           const defaultW = isWider ? targetDim : Math.round(targetDim * aspect * 10) / 10;
           const defaultH = isWider ? Math.round((targetDim / aspect) * 10) / 10 : targetDim;
-          const effDpi = img.width / (defaultW / 25.4);
+          const effDpi = (cropped.width || img.width) / (defaultW / 25.4);
           const perimeterResult = await extractArtworkPerimeter(dataUrl, 1024, 16);
           const perimeterPoints = perimeterResult.points;
 
@@ -117,8 +130,8 @@ export const ArtworkManagerStep: React.FC = () => {
             fileSizeBytes: file.size,
             fileType: file.type as any,
             dataUrl,
-            originalWidthPx: img.width,
-            originalHeightPx: img.height,
+            originalWidthPx: cropped.width || img.width,
+            originalHeightPx: cropped.height || img.height,
             aspectRatio: aspect,
             widthMm: defaultW,
             heightMm: defaultH,
@@ -183,6 +196,9 @@ export const ArtworkManagerStep: React.FC = () => {
         dataUrl: res.dataUrl,
         fileType: 'image/png',
         svgContent: undefined,
+        originalWidthPx: res.width,
+        originalHeightPx: res.height,
+        aspectRatio: res.height > 0 ? res.width / res.height : asset.aspectRatio,
         perimeterPoints: finalPerimeter,
         originalPerimeterPoints: finalPerimeter,
         smoothing: 0.35,

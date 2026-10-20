@@ -310,6 +310,17 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
             merged.svgContent = undefined;
           }
         }
+        // Background removal crops the artwork to its silhouette, which changes
+        // the aspect ratio. Keep the configured total width and re-derive the
+        // height so the artwork is never stretched.
+        if (
+          updates.aspectRatio &&
+          updates.aspectRatio > 0 &&
+          updates.widthMm === undefined &&
+          updates.heightMm === undefined
+        ) {
+          merged.heightMm = Math.round((merged.widthMm / updates.aspectRatio) * 10) / 10;
+        }
         return merged;
       });
       const effMedia = computeEffectiveMedia(

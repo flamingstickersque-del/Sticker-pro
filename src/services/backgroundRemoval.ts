@@ -383,6 +383,67 @@ async function runAiNeuralSegmentation(
  * - 'exterior_flood': Exterior magic wand
  * - 'chroma_key': Global color key
  */
+/**
+ * Crops a canvas to the bounding box of its non-transparent pixels.
+ *
+ * Background removal leaves the original rectangular canvas intact, so the
+ * artwork occupies only part of it. Cropping makes the artwork canvas equal to
+ * the artwork silhouette, which is what the physical sizing presets assume.
+ * A small transparent margin is retained so antialiased edges are not clipped.
+ */
+export function cropToAlphaBounds(
+  source: HTMLCanvasElement,
+  width: number,
+  height: number,
+  marginPx = 0,
+  alphaThreshold = 8
+): { canvas: HTMLCanvasElement; width: number; height: number; cropped: boolean } {
+  const ctx = source.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return { canvas: source, width, height, cropped: false };
+
+  const data = ctx.getImageData(0, 0, width, height).data;
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      if (data[(row + x) * 4 + 3] < alphaThreshold) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return { canvas: source, width, height, cropped: false };
+  }
+
+  const x0 = Math.max(0, minX - marginPx);
+  const y0 = Math.max(0, minY - marginPx);
+  const x1 = Math.min(width - 1, maxX + marginPx);
+  const y1 = Math.min(height - 1, maxY + marginPx);
+  const cropW = x1 - x0 + 1;
+  const cropH = y1 - y0 + 1;
+
+  if (cropW === width && cropH === height) {
+    return { canvas: source, width, height, cropped: false };
+  }
+
+  const out = document.createElement('canvas');
+  out.width = cropW;
+  out.height = cropH;
+  const outCtx = out.getContext('2d');
+  if (!outCtx) return { canvas: source, width, height, cropped: false };
+
+  outCtx.drawImage(source, x0, y0, cropW, cropH, 0, 0, cropW, cropH);
+  return { canvas: out, width: cropW, height: cropH, cropped: true };
+}
+
 export async function removeImageBackground(
   options: BackgroundRemovalOptions
 ): Promise<BackgroundRemovalResult> {
@@ -425,12 +486,16 @@ export async function removeImageBackground(
       const W = img.naturalWidth || img.width;
       const H = img.naturalHeight || img.height;
 
-      // Sample removed ratio
+      // Sample removed ratio, then crop to the artwork silhouette so the
+      // artwork canvas matches the cutline coordinate frame.
       const canvas = document.createElement('canvas');
       canvas.width = W;
       canvas.height = H;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       let removedRatio = 35.0;
+      let outWidth = W;
+      let outHeight = H;
+      let outDataUrl = dataUrl;
 
       if (ctx) {
         ctx.drawImage(img, 0, 0);
@@ -440,14 +505,19 @@ export async function removeImageBackground(
           if (data[i] < 30) transparentCount++;
         }
         removedRatio = Math.round((transparentCount / (W * H)) * 1000) / 10;
+
+        const cropped = cropToAlphaBounds(canvas, W, H, 0);
+        outWidth = cropped.width;
+        outHeight = cropped.height;
+        if (cropped.cropped) outDataUrl = cropped.canvas.toDataURL('image/png');
       }
 
       if (onProgress) onProgress(100, 'Complete');
 
       return {
-        dataUrl,
-        width: W,
-        height: H,
+        dataUrl: outDataUrl,
+        width: outWidth,
+        height: outHeight,
         detectedColor: { r: 255, g: 255, b: 255 },
         removedRatio,
         engineUsed: 'ai_neural',
@@ -647,14 +717,20 @@ export async function removeImageBackground(
         }
 
         ctx.putImageData(imgData, 0, 0);
-        const resultDataUrl = canvas.toDataURL('image/png');
+
+        // Crop to the artwork's true silhouette bounds so the artwork canvas and
+        // the cutline share one coordinate frame. Without this, transparent
+        // padding left over from the original rectangle makes the cutline
+        // smaller than the configured physical sticker size.
+        const cropped = cropToAlphaBounds(canvas, W, H, 0);
+        const resultDataUrl = cropped.canvas.toDataURL('image/png');
 
         if (onProgress) onProgress(100, 'Complete');
 
         resolve({
           dataUrl: resultDataUrl,
-          width: W,
-          height: H,
+          width: cropped.width,
+          height: cropped.height,
           detectedColor: bgRgb,
           removedRatio: Math.round((totalRemoved / totalPixels) * 1000) / 10,
           engineUsed: activeEngine,
